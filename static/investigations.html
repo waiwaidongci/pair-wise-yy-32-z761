@@ -1,0 +1,132 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>实验室异常调查</title>
+<style>
+body{font:15px system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1080px;margin:24px auto;padding:0 20px;color:#1f2933}
+h1{font-size:22px}.sub{color:#666;margin-top:-6px}
+.bar{display:flex;gap:10px;align-items:center;margin:14px 0}
+.bar input{padding:6px 8px;border:1px solid #cbd2d9;border-radius:6px}
+button{padding:7px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer}
+button.ghost{background:#e4e7eb;color:#1f2933}
+section{margin-top:22px}
+h2{font-size:17px;border-left:4px solid #2563eb;padding-left:8px}
+h2.closed{border-color:#059669}
+.card{border:1px solid #d9dee3;border-radius:8px;margin:10px 0;overflow:hidden}
+.card.await{border-left:5px solid #d97706}.card.open{border-left:5px solid #dc2626}.card.closed{border-left:5px solid #059669;opacity:.92}
+.card-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 14px;background:#f8fafc;cursor:pointer}
+.card-head b{font-size:15px}.tag{font-size:12px;padding:2px 8px;border-radius:999px;background:#e5e7eb}
+.tag.open{background:#fee2e2;color:#b91c1c}.tag.awaiting_confirmation{background:#fef3c7;color:#92400e}.tag.closed{background:#d1fae5;color:#065f46}
+.blockers{color:#b91c1c;font-size:13px;flex-basis:100%}.blockers div::before{content:"⛔ ";font-size:12px}
+.card-body{padding:12px 16px;border-top:1px solid #eef1f4;display:none}
+.card.open-body .card-body{display:block}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:4px 12px;font-size:14px;margin:6px 0}
+.kv .k{color:#666}
+table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0}
+th,td{border:1px solid #e3e8ee;padding:5px 8px;text-align:left}
+.bad{color:#b91c1c;font-weight:600}.ok{color:#047857;font-weight:600}
+form{margin:10px 0;padding:10px;background:#f8fafc;border-radius:8px}
+form label{display:block;font-size:12px;color:#555;margin:6px 0 2px}
+form input,form textarea,form select{width:100%;box-sizing:border-box;padding:6px;border:1px solid #cbd2d9;border-radius:6px;font:inherit}
+form .row{display:flex;gap:10px}.row>div{flex:1}
+h4{margin:12px 0 4px;font-size:13px;color:#334155}
+.timeline{list-style:none;padding-left:0;font-size:13px;border-left:2px solid #e3e8ee;margin:8px 0 8px 4px}
+.timeline li{padding:3px 0 3px 12px}.timeline .at{color:#8a94a0;margin-right:6px}.timeline .who{color:#2563eb;margin-right:6px}
+.versions{font-size:12px;color:#555}
+#msg{min-height:20px;font-size:13px;color:#b91c1c;margin:6px 0}
+a{color:#2563eb}
+</style>
+<h1>实验室异常调查 (OOS / Lab Investigation)</h1>
+<p class="sub">首检不合格自动建立待查记录；登记原因、复验方案、负责人；复验回写后提交结论，结论须由另一名质量人员确认方可正式放行。
+<a href="/">← 返回批次总览</a></p>
+<div class="bar">
+  <button onclick="load()">刷新</button>
+  <span>身份</span><input id="actor" value="lab1" style="width:90px">
+  <select id="role" style="padding:6px;border-radius:6px">
+    <option value="lab">lab 化验员</option><option value="inspector">inspector 检验员</option>
+    <option value="qa">qa 质量人员</option><option value="operator">operator</option>
+  </select>
+  <span id="counts" class="sub"></span>
+</div>
+<div id="msg"></div>
+<section><h2>待查 / 待确认</h2><div id="openList">加载中...</div></section>
+<section><h2 class="closed">已关闭（含历史版本留档）</h2><div id="closedList"></div></section>
+
+<script>
+const $=id=>document.getElementById(id);
+function headers(extra){return Object.assign({"Content-Type":"application/json","X-Actor":$("actor").value,"X-Role":$("role").value},extra||{})}
+async function api(path,opt){
+  const r=await fetch(path,Object.assign({headers:headers()},opt));
+  const data=await r.json();
+  if(!r.ok){$("msg").textContent="错误: "+(data.error||r.status);throw data.error||r.status}
+  $("msg").textContent="";return data;
+}
+function esc(s){return (s??"").toString().replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function tag(s){const m={open:"待查",awaiting_confirmation:"待第二人确认",closed:"已关闭"};return `<span class="tag ${s}">${m[s]||s}</span>`}
+function testRow(t){return `<tr><td>${t.round}</td><td>${esc(t.test_type)}</td><td>${t.result}</td><td>${t.spec_min}~${t.spec_max}</td><td class="${t.passed?'ok':'bad'}">${t.passed?'合格':'不合格'}</td><td>${esc(t.recorded_by)}</td></tr>`}
+
+function card(it,detail){
+  const blockers=(it.block_reasons||[]).map(x=>`<div>${esc(x)}</div>`).join("");
+  let body=`<div class="kv">
+      <span class="k">批次 / 产品</span><span>${esc(it.batch_no)} · ${esc(it.product)}${it.factory_name?(" · "+esc(it.factory_name)):""}</span>
+      <span class="k">异常检验项</span><span>${esc(it.test_type)}（当前版本 v${it.version}）</span>
+      <span class="k">异常原因</span><span>${esc(it.reason)||'<i class="bad">未登记</i>'}</span>
+      <span class="k">复验方案</span><span>${esc(it.retest_plan)||'<i class="bad">未登记</i>'}</span>
+      <span class="k">负责人</span><span>${esc(it.owner)||'<i class="bad">未指定</i>'}</span>
+      <span class="k">调查结论</span><span>${esc(it.result_conclusion)||"—"}${it.key_deviation?' <b class="bad">[关键偏差]</b>':''}</span>
+      <span class="k">处置</span><span>${esc(it.disposition)||"—"}</span>
+      <span class="k">提交 / 确认</span><span>${esc(it.concluded_by)||"—"} → ${esc(it.confirmed_by)||'<i>待确认</i>'}</span>
+    </div>`;
+  const tests=(detail&&detail.tests)||(it.latest_test?[it.latest_test]:[]);
+  body+=`<h4>最新检验与复验（${tests.length} 条，末条为最新）</h4><table><tr><th>轮次</th><th>项目</th><th>结果</th><th>标准</th><th>判定</th><th>记录人</th></tr>${tests.map(testRow).join("")}</table>`;
+  if(it.status==="open"){
+    const rev=detail?detail.batch_revision_now:it.batch_revision;
+    body+=`<form onsubmit="return doRegister(event,${it.id})">
+      <input type="hidden" name="expected_revision" value="${rev}">
+      <div class="row"><div><label>异常原因</label><textarea name="reason" rows="2">${esc(it.reason)}</textarea></div>
+      <div><label>复验方案</label><textarea name="retest_plan" rows="2">${esc(it.retest_plan)}</textarea></div></div>
+      <div class="row"><div><label>负责人</label><input name="owner" value="${esc(it.owner)}"></div>
+      <div style="max-width:200px"><label>&nbsp;</label><button type="submit">登记调查</button></div></div></form>`;
+    body+=`<form onsubmit="return doConclude(event,${it.id})">
+      <input type="hidden" name="expected_revision" value="${rev}">
+      <div class="row"><div><label>调查结论（须复验合格回写后）</label><textarea name="result_conclusion" rows="2"></textarea></div></div>
+      <div class="row"><div><label>处置意见</label><input name="disposition" placeholder="如：返工后复检合格，建议放行"></div>
+      <div style="max-width:170px"><label>关键偏差</label><select name="key_deviation"><option value="false">否</option><option value="true">是（阻止正式放行）</option></select></div>
+      <div style="max-width:200px"><label>&nbsp;</label><button type="submit">提交结论</button></div></div></form>`;
+  }
+  if(it.status==="awaiting_confirmation"){
+    const rev=detail?detail.batch_revision_now:it.batch_revision;
+    body+=`<form onsubmit="return doConfirm(event,${it.id})">
+      <input type="hidden" name="expected_revision" value="${rev}">
+      <button type="submit">由当前身份（须为另一名 qa）确认并关闭</button></form>`;
+  }
+  if(detail){
+    body+=`<h4>调查时间线</h4><ul class="timeline">${detail.events.map(e=>
+      `<li><span class="at">${esc(e.at)}</span><span class="who">${esc(e.actor)}</span>${esc(e.kind)} — ${esc(e.detail)}</li>`).join("")}</ul>`;
+    if(detail.versions&&detail.versions.length)
+      body+=`<div class="versions">历史版本：${detail.versions.map(v=>`v${v.version}（${esc(v.status)}，${esc(v.archived_at)}：${esc(v.archived_reason)}）`).join(" ｜ ")}</div>`;
+  } else {
+    body+=`<p><button class="ghost" type="button" onclick="expand(${it.id},this)">展开时间线与全部检验</button></p>`;
+  }
+  return `<div class="card ${it.status}" id="card-${it.id}"><div class="card-head" onclick="toggle(${it.id})">
+      <b>#${it.id} ${esc(it.test_type)}</b>${tag(it.status)}<span class="sub">v${it.version} · ${esc(it.batch_no)}</span>
+      ${blockers?`<div class="blockers">${blockers}</div>`:""}</div><div class="card-body">${body}</div></div>`;
+}
+function toggle(id){$("card-"+id).classList.toggle("open-body")}
+async function expand(id,btn){btn.disabled=true;const d=await api(`/api/investigations/${id}`);
+  const body=$(`card-${id}`).querySelector(".card-body");body.innerHTML=card(d,d).match(/<div class="card-body">([\s\S]*)<\/div>/)[1];
+  $("card-"+id).classList.add("open-body")}
+function formJson(f){const o={};for(const el of f.elements){if(!el.name)continue;
+  if(el.name==="key_deviation")o[el.name]=el.value==="true";
+  else if(el.name==="expected_revision")o[el.name]=parseInt(el.value);
+  else o[el.name]=el.value}return o}
+async function post(path,f){await api(path,{method:"POST",body:JSON.stringify(formJson(f))});await load();return false}
+const doRegister=(e,id)=>post(`/api/investigations/${id}/register`,e.target);
+const doConclude=(e,id)=>post(`/api/investigations/${id}/conclude`,e.target);
+const doConfirm=(e,id)=>post(`/api/investigations/${id}/confirm`,e.target);
+async function load(){
+  const d=await api("/api/investigations");
+  $("counts").textContent=`待查 ${d.open.length} 项 ｜ 已关闭 ${d.closed.length} 项`;
+  $("openList").innerHTML=d.open.length?d.open.map(x=>card(x)).join(""):"<p class='sub'>无待查项</p>";
+  $("closedList").innerHTML=d.closed.length?d.closed.map(x=>card(x)).join(""):"<p class='sub'>无已关闭项</p>";
+}
+$("role").addEventListener("change",()=>{});
+load();
+</script></html>

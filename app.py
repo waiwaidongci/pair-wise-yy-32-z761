@@ -6,34 +6,15 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from common import ApiError, after_now, j, now
+from investigations.service import InvestigationService
+from investigations.store import InvestigationStore
 
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def after_now(value: str | None = None) -> bool:
-    if not value:
-        return False
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")) > datetime.now(timezone.utc)
-    except ValueError:
-        return False
-
-
-def j(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -92,6 +73,7 @@ class Store:
         );
         """)
         self.conn.commit()
+        InvestigationStore(self.conn)  # investigation tables live in the investigations package
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -102,7 +84,9 @@ class Store:
 
 
 class BatchService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.investigations = InvestigationService(self.conn, InvestigationStore(self.conn), store.audit)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -191,8 +175,10 @@ class BatchService:
             cur = self.conn.execute("""INSERT INTO tests(batch_id,test_type,result,spec_min,spec_max,passed,round,recorded_by,created_at)
                                      VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, test_type, result, spec_min, spec_max, passed, round_no, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation" if (batch["state"] == "awaiting_resample" or not passed) else batch["state"])
+            test_row = self._row("tests", cur.lastrowid)
+            self.investigations.on_test_recorded(batch_id, test_row, actor)
             self.store.audit(actor, "test.record", "batch", batch_id, {"test_type": test_type, "result": result, "passed": bool(passed), "round": round_no})
-        return self._test_dict(self._row("tests", cur.lastrowid))
+        return self._test_dict(test_row)
 
     def plan_rework(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, description: str, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"operator"})
@@ -201,6 +187,7 @@ class BatchService:
         with self.conn:
             cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,created_by,created_at) VALUES(?,?,'planned',?,?)", (batch_id, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
+            self.investigations.on_source_changed(batch_id, "返工资料修改", actor, {"description": description})
             self.store.audit(actor, "rework.plan", "rework", cur.lastrowid, {"batch_id": batch_id, "description": description})
         return dict(self._row("rework", cur.lastrowid))
 
@@ -211,6 +198,7 @@ class BatchService:
         with self.conn:
             self.conn.execute("UPDATE rework SET status='completed',completed_by=?,completed_at=? WHERE id=?", (actor, now(), rework_id))
             self._advance_batch(batch["id"], expected_revision, "investigation")
+            self.investigations.on_source_changed(batch["id"], "返工完成结果回写", actor, {"rework_id": rework_id})
             self.store.audit(actor, "rework.complete", "rework", rework_id, {"batch_id": batch["id"]})
         return dict(self._row("rework", rework_id))
 
@@ -221,6 +209,8 @@ class BatchService:
             cur = self.conn.execute("INSERT INTO supplier_changes(batch_id,supplier,change_type,description,recorded_by,created_at) VALUES(?,?,?,?,?,?)",
                                     (batch_id, supplier, change_type, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
+            self.investigations.on_source_changed(batch_id, "供应商资料变更", actor,
+                                                  {"supplier": supplier, "change_type": change_type})
             self.store.audit(actor, "supplier_change.record", "batch", batch_id, {"supplier": supplier, "change_type": change_type})
         return dict(self._row("supplier_changes", cur.lastrowid))
 
@@ -260,6 +250,11 @@ class BatchService:
             raise ApiError(409, "未关闭的关键偏差阻止放行")
         elif decision == "release" and open_deviations:
             raise ApiError(409, "仍有未关闭偏差，不能正式放行")
+        elif decision == "release":
+            inv_blockers = self.investigations.release_blockers_for_batch(batch_id)
+            if inv_blockers:
+                raise ApiError(409, "实验室异常调查未闭环，正式放行被阻断：" + "；".join(inv_blockers))
+            new_state = "released"
         elif decision == "conditional":
             for deviation in open_deviations:
                 if not deviation["exception_reason"] or not after_now(deviation["exception_until"]):
@@ -290,7 +285,14 @@ class BatchService:
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
+                "investigations": self.investigations_for_batch(batch_id),
+                "release_blockers": self.investigations.release_blockers_for_batch(batch_id),
                 "decisions": rows("decisions")}
+
+    def investigations_for_batch(self, batch_id: int) -> list[dict]:
+        return [self.investigations._serialize(row)
+                for row in self.conn.execute(
+                    "SELECT * FROM investigations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()]
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -331,16 +333,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            p = self._parts()
+            parsed = urlparse(self.path); p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "investigations"]:
+                status = (parse_qs(parsed.query).get("status") or [None])[0]
+                out = self.service.investigations.list(status)
+            elif len(p) == 3 and p[:2] == ["api", "investigations"]:
+                out = self.service.investigations.detail(int(p[2]))
             elif len(p) == 3 and p[:2] == ["api", "batches"]: out = self.service.batch_detail(int(p[2]))
+            elif p == ["investigations"]:
+                self._serve_page("investigations.html"); return
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
         except Exception as exc: self._send(500, {"error": str(exc)})
+
+    def _serve_page(self, name: str) -> None:
+        page = (Path(__file__).parent / "static" / name).read_bytes()
+        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page)
 
     def do_POST(self) -> None:
         try:
@@ -356,6 +370,9 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
+            elif len(p) == 4 and p[:2] == ["api", "investigations"] and p[3] == "register": out = self.service.investigations.register(actor, role, int(p[2]), b.get("reason", ""), b.get("retest_plan", ""), b.get("owner", ""), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "investigations"] and p[3] == "conclude": out = self.service.investigations.submit_conclusion(actor, role, int(p[2]), b.get("result_conclusion", ""), bool(b.get("key_deviation", False)), b.get("disposition", ""), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "investigations"] and p[3] == "confirm": out = self.service.investigations.confirm(actor, role, int(p[2]), int(b.get("expected_revision", -1)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

@@ -19,17 +19,31 @@ class BatchFlowTest(unittest.TestCase):
         dev = self.s.add_deviation("operator", "operator", self.f1, batch["id"], "minor", "装量轻微偏离", self.future, batch["revision"])
         failed = self.s.record_test("lab", "lab", self.f1, batch["id"], "含量", 89, 95, 105, dev["batch_id"] and self.s.batch_detail(batch["id"])["batch"]["revision"])
         self.assertFalse(failed["passed"])
+        # failed first inspection opens a lab investigation that must be worked through
+        inv = self.s.investigations.list()["open"][0]
+        self.s.investigations.register("lab", "lab", inv["id"], "装量波动导致含量偏低", "重新取样复测含量", "lab", self.s.batch_detail(batch["id"])["batch"]["revision"])
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         passed = self.s.record_test("lab", "lab", self.f1, batch["id"], "含量", 99, 95, 105, current)
         self.assertTrue(passed["passed"])
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
-        self.s.close_deviation("qa", "qa", dev["id"], "调整灌装参数", current)
+        self.s.investigations.submit_conclusion("lab", "lab", inv["id"], "复测合格，确认为偶然偏差", False, "继续放行", current)
+        current = self.s.batch_detail(batch["id"])["batch"]["revision"]
+        self.s.investigations.confirm("qa2", "qa", inv["id"], current)
+        current = self.s.batch_detail(batch["id"])["batch"]["revision"]
+        self.s.close_deviation("qa1", "qa", dev["id"], "调整灌装参数", current)
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         rw = self.s.plan_rework("operator", "operator", self.f1, batch["id"], "返工包装", current)
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         self.s.complete_rework("operator", "operator", self.f1, rw["id"], current)
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         self.s.record_stability("lab", "lab", self.f1, batch["id"], "25C/60RH", "3m", 99, 105, current)
+        current = self.s.batch_detail(batch["id"])["batch"]["revision"]
+        # rework after closure re-opened the investigation as v2: re-conclude and get a second person to confirm
+        self.assertEqual(2, self.s.investigations.detail(inv["id"])["version"])
+        self.s.investigations.submit_conclusion("lab", "lab", inv["id"], "返工后评估无影响，复测仍合格", False,
+                                                "返工完成，继续放行", current)
+        current = self.s.batch_detail(batch["id"])["batch"]["revision"]
+        self.s.investigations.confirm("qa2", "qa", inv["id"], current)
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         result = self.s.decide("qa", "qa", batch["id"], "release", "调查关闭，复测合格", current)
         self.assertEqual("released", result["batch"]["state"])
