@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import rules
+from investigations import InvestigationError, InvestigationService
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -102,7 +105,10 @@ class Store:
 
 
 class BatchService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.investigations = InvestigationService(store)
+        self.investigations.init_schema()
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -191,6 +197,9 @@ class BatchService:
             cur = self.conn.execute("""INSERT INTO tests(batch_id,test_type,result,spec_min,spec_max,passed,round,recorded_by,created_at)
                                      VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, test_type, result, spec_min, spec_max, passed, round_no, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation" if (batch["state"] == "awaiting_resample" or not passed) else batch["state"])
+            self.investigations.on_batch_data_changed(batch_id, actor, "test", {"test_type": test_type, "round": round_no, "result": result, "passed": bool(passed)})
+            if not passed:
+                self.investigations.open_for_failure(batch_id, test_type, actor)
             self.store.audit(actor, "test.record", "batch", batch_id, {"test_type": test_type, "result": result, "passed": bool(passed), "round": round_no})
         return self._test_dict(self._row("tests", cur.lastrowid))
 
@@ -201,6 +210,7 @@ class BatchService:
         with self.conn:
             cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,created_by,created_at) VALUES(?,?,'planned',?,?)", (batch_id, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
+            self.investigations.on_batch_data_changed(batch_id, actor, "rework", {"rework_id": cur.lastrowid, "action": "plan", "description": description})
             self.store.audit(actor, "rework.plan", "rework", cur.lastrowid, {"batch_id": batch_id, "description": description})
         return dict(self._row("rework", cur.lastrowid))
 
@@ -211,6 +221,7 @@ class BatchService:
         with self.conn:
             self.conn.execute("UPDATE rework SET status='completed',completed_by=?,completed_at=? WHERE id=?", (actor, now(), rework_id))
             self._advance_batch(batch["id"], expected_revision, "investigation")
+            self.investigations.on_batch_data_changed(batch["id"], actor, "rework", {"rework_id": rework_id, "action": "complete"})
             self.store.audit(actor, "rework.complete", "rework", rework_id, {"batch_id": batch["id"]})
         return dict(self._row("rework", rework_id))
 
@@ -221,6 +232,7 @@ class BatchService:
             cur = self.conn.execute("INSERT INTO supplier_changes(batch_id,supplier,change_type,description,recorded_by,created_at) VALUES(?,?,?,?,?,?)",
                                     (batch_id, supplier, change_type, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
+            self.investigations.on_batch_data_changed(batch_id, actor, "supplier_change", {"supplier": supplier, "change_type": change_type})
             self.store.audit(actor, "supplier_change.record", "batch", batch_id, {"supplier": supplier, "change_type": change_type})
         return dict(self._row("supplier_changes", cur.lastrowid))
 
@@ -235,39 +247,44 @@ class BatchService:
             self.store.audit(actor, "stability.record", "batch", batch_id, {"condition": condition, "timepoint": timepoint, "passed": bool(passed)})
         return dict(self._row("stability", cur.lastrowid))
 
+    def register_investigation(self, actor: str | None, role: str | None, investigation_id: int, cause: str, retest_plan: str, owner: str) -> dict:
+        actor = self._actor(actor, role, {"lab", "qa"})
+        try:
+            with self.conn:
+                return self.investigations.register(investigation_id, cause, retest_plan, owner, actor)
+        except InvestigationError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+
+    def conclude_investigation(self, actor: str | None, role: str | None, investigation_id: int, conclusion: str) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        try:
+            with self.conn:
+                return self.investigations.conclude(investigation_id, conclusion, actor)
+        except InvestigationError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+
+    def confirm_investigation(self, actor: str | None, role: str | None, investigation_id: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        try:
+            with self.conn:
+                return self.investigations.confirm(investigation_id, actor)
+        except InvestigationError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+
     def decide(self, actor: str | None, role: str | None, batch_id: int, decision: str, rationale: str, expected_revision: int, exception_code: str = "") -> dict:
         actor = self._actor(actor, role, {"qa"})
         batch = self._row("batches", batch_id)
-        if decision not in {"release", "reject", "conditional", "resample"}: raise ApiError(400, "放行决定不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
+        if decision not in rules.DECISIONS: raise ApiError(400, "放行决定不合法")
+        if batch["state"] in rules.TERMINAL_STATES: raise ApiError(409, "批次已经是终态")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
         deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
-        open_deviations = [d for d in deviations if d["status"] == "open"]
-        latest_tests: dict[str, sqlite3.Row] = {}
-        for row in self.conn.execute("SELECT * FROM tests WHERE batch_id=? ORDER BY id", (batch_id,)):
-            latest_tests[row["test_type"]] = row
-        if decision in {"release", "conditional"} and not latest_tests:
-            raise ApiError(409, "放行前至少需要一项检验结果")
-        if decision in {"release", "conditional"} and any(not row["passed"] for row in latest_tests.values()):
-            raise ApiError(409, "最新检验结果仍有不合格项")
-        if decision == "resample":
-            if batch["state"] == "conditional": raise ApiError(409, "有条件放行后不能直接改为再取样")
-            new_state = "awaiting_resample"
-        elif decision == "reject":
-            new_state = "rejected"
-        elif any(d["severity"] == "critical" for d in open_deviations):
-            raise ApiError(409, "未关闭的关键偏差阻止放行")
-        elif decision == "release" and open_deviations:
-            raise ApiError(409, "仍有未关闭偏差，不能正式放行")
-        elif decision == "conditional":
-            for deviation in open_deviations:
-                if not deviation["exception_reason"] or not after_now(deviation["exception_until"]):
-                    raise ApiError(409, f"偏差 {deviation['id']} 没有有效例外批准")
-            if not exception_code.strip(): raise ApiError(400, "有条件放行必须提供例外编号")
-            new_state = "conditional"
-        else:
-            new_state = "released"
+        latest_tests = rules.latest_by_type(self.conn.execute("SELECT * FROM tests WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall())
+        investigations = self.investigations.for_batch(batch_id, with_archive=False)
+        blockers = rules.decision_blockers(decision, batch["state"], deviations, latest_tests, investigations, after_now)
+        if blockers: raise ApiError(409, blockers[0])
+        if decision == "conditional" and not exception_code.strip(): raise ApiError(400, "有条件放行必须提供例外编号")
+        new_state = rules.NEXT_STATE[decision]
         with self.conn:
             cur = self.conn.execute("""INSERT INTO decisions(batch_id,revision,decision,rationale,exception_code,decided_by,created_at)
                                      VALUES(?,?,?,?,?,?,?)""", (batch_id, batch["revision"], decision, rationale, exception_code or None, actor, now()))
@@ -290,7 +307,7 @@ class BatchService:
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+                "decisions": rows("decisions"), "investigations": self.investigations.for_batch(batch_id)}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -310,6 +327,7 @@ class BatchService:
     def state(self) -> dict:
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
                 "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
+                "investigations": self.investigations.list_all(),
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -356,6 +374,9 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
+            elif len(p) == 4 and p[:2] == ["api", "investigations"] and p[3] == "register": out = self.service.register_investigation(actor, role, int(p[2]), b.get("cause", ""), b.get("retest_plan", ""), b.get("owner", ""))
+            elif len(p) == 4 and p[:2] == ["api", "investigations"] and p[3] == "conclude": out = self.service.conclude_investigation(actor, role, int(p[2]), b.get("conclusion", ""))
+            elif len(p) == 4 and p[:2] == ["api", "investigations"] and p[3] == "confirm": out = self.service.confirm_investigation(actor, role, int(p[2]))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

@@ -1,1 +1,42 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行与实验室异常调查</title><style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+section{margin-top:24px}
+details.inv{border:1px solid #d0d7de;border-radius:8px;margin:8px 0;padding:8px 12px}
+details.inv summary{cursor:pointer;font-weight:600}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:13px;margin-left:6px}
+.tag.open{background:#fff3cd}.tag.closed{background:#d3f9d8}
+ul.blockers{color:#b42318;margin:6px 0 0 18px;padding:0}
+.meta{color:#57606a;font-size:14px;font-weight:400}
+table{border-collapse:collapse;margin-top:6px}td,th{border:1px solid #d0d7de;padding:4px 10px;font-size:14px}
+</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。首检不合格自动建立实验室异常调查；调查未关闭或存在关键偏差时，正式放行被阻断。</p><button onclick="loadState()">刷新状态</button>
+<section><h2>实验室异常调查 · 待查</h2><div id="pending">加载中...</div></section>
+<section><h2>实验室异常调查 · 已关闭</h2><div id="closed">加载中...</div></section>
+<section><details><summary>原始状态</summary><pre id="state">加载中...</pre></details></section>
+<script>
+const STATUS={pending:"待查",concluded:"待确认",closed:"已关闭"};
+const VERDICT={pass:"合格",fail:"不合格",none:"无结果"};
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function latestTestHtml(t){
+  if(!t)return '<p class="meta">尚无检验记录</p>';
+  return `<table><tr><th>轮次</th><th>结果</th><th>标准</th><th>判定</th><th>记录人</th></tr><tr><td>${t.round}</td><td>${t.result}</td><td>${t.spec_min} ~ ${t.spec_max}</td><td>${t.passed?"合格":"不合格"}</td><td>${esc(t.recorded_by)}</td></tr></table>`;
+}
+function invHtml(inv){
+  const blockers=inv.blockers.length?`<ul class="blockers">${inv.blockers.map(b=>`<li>${esc(b)}</li>`).join("")}</ul>`:'<p class="meta">无阻断原因</p>';
+  return `<details class="inv"><summary>#${inv.id} ${esc(inv.batch_no)} · ${esc(inv.test_type)}<span class="tag ${inv.status==="closed"?"closed":"open"}">${STATUS[inv.status]||inv.status}</span> <span class="meta">v${inv.version} · 最新判定:${VERDICT[inv.verdict]||inv.verdict}</span></summary>
+<p>异常原因:${esc(inv.cause)||"—"}<br>复验方案:${esc(inv.retest_plan)||"—"}<br>负责人:${esc(inv.owner)||"—"}</p>
+<p class="meta">结论:${esc(inv.conclusion)||"—"}(提交:${esc(inv.concluded_by)||"—"} / 确认:${esc(inv.confirmed_by)||"—"})</p>
+<div>最新检验:${latestTestHtml(inv.latest_test)}</div>
+<div>阻断原因:${blockers}</div></details>`;
+}
+async function loadState(){
+  const data=await (await fetch("/api/state")).json();
+  const invs=data.investigations||[];
+  const open=invs.filter(i=>i.status!=="closed"),closed=invs.filter(i=>i.status==="closed");
+  document.getElementById("pending").innerHTML=open.length?open.map(invHtml).join(""):'<p class="meta">暂无待查调查</p>';
+  document.getElementById("closed").innerHTML=closed.length?closed.map(invHtml).join(""):'<p class="meta">暂无已关闭调查</p>';
+  document.getElementById("state").textContent=JSON.stringify(data,null,2);
+}
+loadState();
+</script></html>

@@ -30,6 +30,10 @@ class BatchFlowTest(unittest.TestCase):
         self.s.complete_rework("operator", "operator", self.f1, rw["id"], current)
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         self.s.record_stability("lab", "lab", self.f1, batch["id"], "25C/60RH", "3m", 99, 105, current)
+        inv = self.s.batch_detail(batch["id"])["investigations"][0]
+        self.s.register_investigation("lab", "lab", inv["id"], "灌装参数漂移", "同一样品复测两次", "王工")
+        self.s.conclude_investigation("qa", "qa", inv["id"], "原因明确，复测合格")
+        self.s.confirm_investigation("qa-2", "qa", inv["id"])
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         result = self.s.decide("qa", "qa", batch["id"], "release", "调查关闭，复测合格", current)
         self.assertEqual("released", result["batch"]["state"])
